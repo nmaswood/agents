@@ -80,6 +80,10 @@ class _EndOfTurnInfo:
     """The turn's open ``user_turn`` span. The activity sets ``user_turn_span_adopted`` to take
     ownership and ends it after ``on_user_turn_completed``; otherwise recognition ends it."""
     user_turn_span_adopted: bool = False
+    overlapping_agent_speech: bool = False
+    """Speech began within the agent's still-active audio playout interval."""
+    discard_on_next_speech: bool = False
+    """Discard this rejected turn at the next speech onset, allowing late final segments first."""
 
 
 def _compute_end_of_turn_metrics(
@@ -292,6 +296,7 @@ class AudioRecognition:
         self._audio_interim_transcript = ""
         # used for STTs that support preflight mode, so it could start preemptive generation earlier
         self._audio_preflight_transcript = ""
+        self._discard_on_next_speech = False
         self._last_language: LanguageCode | None = None
 
         self._stt_pipeline: _STTPipeline | None = None
@@ -1013,7 +1018,8 @@ class AudioRecognition:
         self._turn_detector_prediction_fut = None
         return stream
 
-    def _clear_user_turn(self) -> None:
+    def _clear_user_turn(self, *, reset_streams: bool = True) -> None:
+        self._discard_on_next_speech = False
         self._audio_transcript = ""
         self._audio_interim_transcript = ""
         self._audio_preflight_transcript = ""
@@ -1024,7 +1030,7 @@ class AudioRecognition:
         self._vad_speech_started = False
         self._user_turn_committed = False
         self._last_emitted_prediction = None
-        if self._turn_detector_stream is not None:
+        if reset_streams and self._turn_detector_stream is not None:
             self._turn_detector_stream.flush(reason="clear_user_turn")
             self._turn_detector_prediction_fut = None
             self._turn_detector_flushed = True
@@ -1037,9 +1043,10 @@ class AudioRecognition:
         self._reset_transcription_timeout()
 
         # reset stt to clear the buffer from previous user turn
-        stt = self._stt
-        self._update_stt(None)
-        self._update_stt(stt)
+        if reset_streams:
+            stt = self._stt
+            self._update_stt(None)
+            self._update_stt(stt)
 
     def _commit_user_turn(
         self,
@@ -1207,6 +1214,12 @@ class AudioRecognition:
         self._process_stt_event(ev)
 
     def _process_stt_event(self, ev: stt.SpeechEvent) -> None:
+        if ev.type == stt.SpeechEventType.START_OF_SPEECH and self._discard_on_next_speech:
+            self._clear_user_turn(reset_streams=False)
+            # _on_stt_event collected this onset's id before clearing the previous turn.
+            if ev.request_id:
+                self._stt_request_ids.append(ev.request_id)
+
         has_stt_end_time = bool(
             len(ev.alternatives) > 0
             and ev.alternatives[0].end_time > 0
@@ -1405,6 +1418,8 @@ class AudioRecognition:
     @utils.log_exceptions(logger=logger)
     async def _on_vad_event(self, ev: vad.VADEvent) -> None:
         if ev.type == vad.VADEventType.START_OF_SPEECH:
+            if self._discard_on_next_speech:
+                self._clear_user_turn(reset_streams=False)
             speech_start_time = time.time() - ev.speech_duration - ev.inference_duration
             self._active_vad_speech_started_at = speech_start_time
             if not self._vad_speech_started:
@@ -1771,9 +1786,16 @@ class AudioRecognition:
                 metrics=metrics,
                 backchannel_over_agent=self._turn_backchannel_over_agent,
                 user_turn_span=user_turn_span,
+                overlapping_agent_speech=(
+                    self._agent_speaking
+                    and self._agent_speech_started_at is not None
+                    and self._speech_start_time is not None
+                    and self._speech_start_time >= self._agent_speech_started_at
+                ),
             )
             committed = self._hooks.on_end_of_turn(end_of_turn)
             if committed:
+                self._discard_on_next_speech = False
                 logger.debug(
                     "user turn committed",
                     extra={
@@ -1826,6 +1848,9 @@ class AudioRecognition:
 
             elif eou_wait_span.is_recording():
                 self._eou_wait_not_committed += 1
+
+            if end_of_turn.discard_on_next_speech:
+                self._discard_on_next_speech = True
 
             # reset turn-scoped barge-in state once per logical turn (commit or drop)
             self._turn_backchannel_over_agent = False
